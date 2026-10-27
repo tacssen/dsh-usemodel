@@ -132,6 +132,17 @@ window.__ModuleLoader__.load({
 			},
 		};
 
+		/** {id,name} 或旧字符串 → 一行 `id` 或 `id => 名字`。 */
+		function modelToLine(m) {
+			if (typeof m === "string") return m;
+			if (m !== null && typeof m === "object") {
+				const id = String(m.id ?? "");
+				const name = String(m.name ?? "");
+				if (id === "") return "";
+				return (name === "" || name === id) ? id : (id + " => " + name);
+			}
+			return "";
+		}
 		const EMPTY = {
 			id: "",
 			name: "",
@@ -196,7 +207,7 @@ window.__ModuleLoader__.load({
 				name: initial?.name ?? "",
 				baseURL: initial?.baseURL ?? "",
 				apiKey: initial?.apiKey ?? "",
-				modelsText: (initial?.models ?? []).join("\n"),
+				modelsText: (initial?.models ?? []).map(modelToLine).filter((line) => line !== "").join("\n"),
 				contextWindow: initial?.contextWindow ? String(initial.contextWindow) : "",
 				maxTokens: initial?.maxTokens ? String(initial.maxTokens) : "",
 			}));
@@ -208,7 +219,7 @@ window.__ModuleLoader__.load({
 
 			const build = useCallback(() => {
 				const models = form.modelsText
-					.split(/[\n,]/)
+					.split(/\r?\n/)
 					.map((m) => m.trim())
 					.filter((m) => m !== "");
 				return {
@@ -253,7 +264,8 @@ window.__ModuleLoader__.load({
 				setMsg(null);
 				setTested(null);
 				const payload = build();
-				const firstModel = payload.channel.models[0] ?? "";
+				const firstEntry = payload.channel.models[0];
+				const firstModel = typeof firstEntry === "string" ? firstEntry : (firstEntry?.id ?? "");
 				if (payload.channel.baseURL === "" || payload.channel.apiKey === "" || firstModel === "") {
 					setMsg({ kind: "err", text: "测连通要填全：Base URL、API Key、至少一个模型名" });
 					setBusy("");
@@ -334,12 +346,12 @@ window.__ModuleLoader__.load({
 						hint: "明文存在 %USERPROFILE%\\.dsh\\usemodel\\config.json，只在本机",
 					}),
 					h(Field, {
-						label: "模型名（一行一个，或逗号分隔）",
+						label: "模型（一行一个；左边真实 id，=> 右边随你起名）",
 						multiline: true,
 						value: form.modelsText,
 						onChange: set("modelsText"),
-						placeholder: "gpt-4o-mini\ngpt-4o",
-						hint: "必须是上游真实模型 id，写错会在对话时报 404",
+						placeholder: "gpt-4o-mini\ngpt-4o => 我的 GPT\n[按量6] deepseek-v4.1-flash-1017 [不补] => DeepSeek",
+						hint: "左边必须是上游真实 id；不写 => 就自动去掉方括号当显示名。点下面按钮能拉真实 id",
 					}),
 					h("div", { style: { ...S.row, marginTop: -6, marginBottom: 12 } },
 						h("button", { style: S.btn, onClick: pullModels, disabled: busy !== "" },
@@ -390,7 +402,7 @@ window.__ModuleLoader__.load({
 				setResult(null);
 				const response = await api("/test", {
 					method: "POST",
-					body: JSON.stringify({ channel, model: channel.models[0] ?? "" }),
+					body: JSON.stringify({ channel, model: typeof channel.models[0] === "string" ? channel.models[0] : (channel.models[0]?.id ?? "") }),
 				});
 				setBusy(false);
 				setResult(response);
@@ -406,7 +418,7 @@ window.__ModuleLoader__.load({
 						),
 						h("div", { style: { ...S.mono, marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
 							channel.baseURL + "  ·  " + maskKey(channel.apiKey)),
-						h("div", { style: { ...S.mono, marginTop: 2 } }, channel.models.join(" · ")),
+						h("div", { style: { ...S.mono, marginTop: 2 } }, channel.models.map((m) => (typeof m === "string" ? m : (m.name || m.id))).join(" · ")),
 					),
 					h("button", { style: S.btn, onClick: runTest, disabled: busy }, busy ? "测试中…" : "测连通"),
 					h("button", { style: S.btn, onClick: () => onEdit(channel) }, "编辑"),

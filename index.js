@@ -38,17 +38,65 @@ function newId() {
   return Math.random().toString(36).slice(2, 10)
 }
 
+/**
+ * 模型名默认美化：中转站爱把分组倍率塞进 id，像
+ * `[按量6] deepseek-v4.1-flash-1017 [不补]`。方括号段对调用没用，只是给人看的标记，
+ * 所以拿它当默认显示名，真实 id 另外单独留着。
+ */
+function prettyModelName(id) {
+  const stripped = String(id).replace(/\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim()
+  return stripped !== '' ? stripped : String(id)
+}
+
+/**
+ * 一行模型配置 → { id, name }。
+ *
+ * 支持三种写法（都按行）：
+ *   `真实id`                     显示名自动从 id 里清理出来
+ *   `真实id => 我起的名字`        显式指定
+ *   `真实id | 我起的名字`         同上（半角/全角竖线都行）
+ * 也接受已经是 { id, name } 的对象，方便手改 JSON。
+ */
+function parseModelEntry(raw) {
+  if (raw !== null && typeof raw === 'object') {
+    const id = String(raw.id ?? raw.model ?? '').trim()
+    if (id === '') return null
+    const name = String(raw.name ?? raw.displayName ?? raw.display ?? '').trim()
+    return { id: id.slice(0, 200), name: (name !== '' ? name : prettyModelName(id)).slice(0, 200) }
+  }
+  const line = String(raw ?? '').trim()
+  if (line === '') return null
+  const split = line.match(/^(.+?)\s*(?:=>|＝>|→|｜|\|)\s*(.+)$/)
+  if (split !== null) {
+    const id = split[1].trim()
+    const name = split[2].trim()
+    if (id === '') return null
+    return { id: id.slice(0, 200), name: (name !== '' ? name : prettyModelName(id)).slice(0, 200) }
+  }
+  return { id: line.slice(0, 200), name: prettyModelName(line).slice(0, 200) }
+}
+
 function normalizeChannel(raw) {
   if (raw === null || typeof raw !== 'object') return null
-  const models = Array.isArray(raw.models)
-    ? raw.models.map(m => String(m).trim()).filter(m => m !== '')
-    : String(raw.models ?? '').split(/[\n,]/).map(m => m.trim()).filter(m => m !== '')
+  const rawModels = Array.isArray(raw.models)
+    ? raw.models
+    : String(raw.models ?? '').split(/\r?\n/).map(m => m.trim()).filter(m => m !== '')
+  const seen = new Set()
+  const models = []
+  for (const entry of rawModels) {
+    const parsed = parseModelEntry(entry)
+    if (parsed === null) continue
+    const dedupe = parsed.id + '\u0000' + parsed.name
+    if (seen.has(dedupe)) continue
+    seen.add(dedupe)
+    models.push(parsed)
+  }
   return {
     id: typeof raw.id === 'string' && raw.id !== '' ? raw.id.slice(0, 64) : newId(),
     name: String(raw.name ?? '').trim().slice(0, 80) || '未命名渠道',
     baseURL: String(raw.baseURL ?? '').trim().replace(/\/+$/, ''),
     apiKey: String(raw.apiKey ?? '').trim(),
-    models: [...new Set(models)].slice(0, 200),
+    models: models.slice(0, 200),
     maxTokens: Number(raw.maxTokens) > 0 ? Math.floor(Number(raw.maxTokens)) : 0,
     contextWindow: Number(raw.contextWindow) > 0 ? Math.floor(Number(raw.contextWindow)) : 0,
     updatedAt: Number(raw.updatedAt) > 0 ? Number(raw.updatedAt) : Date.now(),
@@ -342,8 +390,9 @@ class UseModelAdapter {
       for (const model of channel.models) {
         out.push({
           provider,
-          id: channel.id + MODEL_SEP + model,
-          name: channel.name + ' · ' + model,
+          // DSH 侧的 id 用真实模型名，改名不会把会话里的模型选择改丢
+          id: channel.id + MODEL_SEP + model.id,
+          name: channel.name + ' · ' + model.name,
           description: channel.baseURL,
           inputModalities: ['text', 'image'],
         })
@@ -356,10 +405,13 @@ class UseModelAdapter {
     const config = this.getConfig()
     const { channelId, model: upstreamModel } = splitModelId(model)
     const channel = config.channels.find(c => c.id === channelId)
+    const entry = channel?.models.find(candidate => candidate.id === upstreamModel)
     return {
       provider,
       id: String(model),
-      name: channel !== undefined ? channel.name + ' · ' + upstreamModel : upstreamModel,
+      name: entry !== undefined
+        ? (channel.name + ' · ' + entry.name)
+        : (channel !== undefined ? channel.name + ' · ' + upstreamModel : upstreamModel),
       inputModalities: ['text', 'image'],
       context: { contextWindow: channel?.contextWindow > 0 ? channel.contextWindow : 128000 },
       defaultMaxTokens: channel?.maxTokens > 0 ? channel.maxTokens : config.defaultMaxTokens,
@@ -845,7 +897,7 @@ async function detectFromInput(text) {
         if (remote.apiKey !== '' && apiKey === '') apiKey = remote.apiKey
         if (remote.name !== '') name = remote.name
         if (remote.models.length > 0 && models.length === 0) {
-          models = remote.models.filter(id => !NON_CHAT.test(id))
+          models = remote.models.filter(id => !NON_CHAT.test(id)).map(id => ({ id, name: prettyModelName(id) }))
           notes.push(`分享链接里带回了 ${remote.models.length} 个模型`)
         }
       } catch (error) {
@@ -867,7 +919,7 @@ async function detectFromInput(text) {
   if (baseURL !== '' && apiKey !== '' && models.length === 0) {
     const probe = await probeModels(baseURL, apiKey)
     if (probe.ok === true) {
-      models = probe.models
+      models = probe.models.map(id => ({ id, name: prettyModelName(id) }))
       notes.push(probe.models.length > 0 ? `探测到 ${probe.models.length} 个对话模型` : '上游没返回可用的模型名')
     } else {
       notes.push(`模型探测失败（HTTP ${probe.status || '-'}：${probe.error}），模型名请手填`)
@@ -1054,7 +1106,7 @@ export function apply(ctx) {
           sendJson(res, 400, { ok: false, error: 'Base URL 和 API Key 都要填' })
           return
         }
-        const model = String(body?.model ?? channel.models[0] ?? '')
+        const model = String(body?.model ?? channel.models[0]?.id ?? '')
         if (model === '') { sendJson(res, 400, { ok: false, error: '先填一个模型名再测' }); return }
         const started = Date.now()
         const controller = new AbortController()

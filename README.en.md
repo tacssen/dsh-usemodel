@@ -52,6 +52,30 @@ list, dropping embedding / rerank / whisper / tts / dall-e style entries.
 
 Recognition pre-fills the editor — nothing is saved until you confirm.
 
+### Model aliases
+
+Upstream ids from relay sites are ugly — they carry group and billing markers:
+
+```
+[按量6] deepseek-v4.1-flash-1017 [不补]
+[反重力1][次][抗截断] gemini-3.8-flash[不补]
+```
+
+Put `=>` between the real id and the name you want to see:
+
+```
+[按量6] deepseek-v4.1-flash-1017 [不补] => DeepSeek V4.1 Flash
+gpt-4o-mini
+```
+
+- Left side must be the exact upstream id.
+- Without `=>`, bracketed segments are stripped automatically for the display name.
+- The DSH-side model id keeps the real id, so renaming never breaks a selected model.
+- Get exact ids via the "pull model list from upstream" button, or `curl {baseURL}/models`.
+
+If you ever see `403 This token has no access to model X`, the key is fine — the model
+name is not exact. new-api style relays answer 403 (not 401) for an unknown model.
+
 ## How it works
 
 - Host half (`index.js`) registers one provider route:

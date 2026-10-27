@@ -34,9 +34,36 @@ mklink /J "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-usemodel" "$e
 | 显示名称 | 模型选择器里显示成「名称 · 模型名」 |
 | Base URL | 填到 `/v1` 这一层，插件自己拼 `/chat/completions` |
 | API Key | 明文存本机配置文件 |
-| 模型名 | 一行一个，必须是上游真实 id |
+| 模型 | 一行一个；左边真实 id，`=>` 右边自己起名 |
 
 保存后**不用重启 DSH**，重新打开模型下拉即可看到。
+
+### 模型显示名
+
+真实 id 来自上游，很多中转站会把分组倍率塞进去，长得很难看：
+
+```
+[按量6] deepseek-v4.1-flash-1017 [不补]
+[反重力1][次][抗截断] gemini-3.8-flash[不补]
+```
+
+用 `=>` 把「调接口用的 id」和「你看到的名字」拆开：
+
+```
+[按量6] deepseek-v4.1-flash-1017 [不补] => DeepSeek V4.1 Flash
+[反重力1][次][抗截断] gemini-3.8-flash[不补] => Gemini 3.8 Flash
+gpt-4o-mini
+```
+
+- 左边必须是**上游真实 id**，一个字符都不能错。
+- 不写 `=>` 就自动把 `[方括号]` 段去掉当显示名。
+- 模型在 DSH 侧的 id 用真实 id，所以**改显示名不会把会话里选中的模型弄丢**。
+- 真实 id 从哪来：编辑弹窗里点「从上游拉取模型列表」，或者 `curl {baseURL}/models`。
+
+### 报 `This token has no access to model X` 时
+
+密钥没坏，是模型名不精确。new-api 系的中转站遇到找不到的模型名回的是这个 403，
+不是 401。照着 `/models` 返回的 id 一字不差抄进去就好。
 
 ## 粘贴识别
 
@@ -80,7 +107,10 @@ mklink /J "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-usemodel" "$e
       "name": "我的 OpenAI",
       "baseURL": "https://api.openai.com/v1",
       "apiKey": "sk-...",
-      "models": ["gpt-4o-mini"],
+      "models": [
+        { "id": "[按量6] deepseek-v4.1-flash-1017 [不补]", "name": "DeepSeek V4.1 Flash" },
+        { "id": "gpt-4o-mini", "name": "gpt-4o-mini" }
+      ],
       "contextWindow": 128000,
       "maxTokens": 8192
     }
@@ -88,6 +118,9 @@ mklink /J "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-usemodel" "$e
   "defaultMaxTokens": 8192
 }
 ```
+
+`models` 里的条目也接受旧写法（纯字符串 `"gpt-4o-mini"`），读进来会归一化成
+`{ id, name }`，`name` 缺省时自动从 id 里清掉方括号段。
 
 删插件不会动这个文件；手改 JSON 后下一次请求就会重读。
 
@@ -101,12 +134,18 @@ mklink /J "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-usemodel" "$e
 
 ## 自检
 
-开发时用 mock ctx 跑过两类测试（不依赖真实 API Key）：
+```bash
+npm test          # 等价于 node test/run.mjs
+```
 
-- `apply()` 的注册调用、适配器方法形状、HTTP API 的增删改查与 baseURL 规范化
-- 起一个假 OpenAI 上游返回 SSE，断言完整 chunk 序列：
-  reasoning/text 聚合、两个并行工具调用的 id/name/参数拼接、usage 扣缓存、`finish.kind = tool-calls`、
-  以及 DSH 消息 → OpenAI 消息的角色投影（system / user / assistant+tool_calls / tool）
+四套测试全部用 mock 内核跑，不联网、不碰真实配置（每个脚本把 `DSH_HOME` 指到临时目录）：
+
+| 文件 | 覆盖 |
+|---|---|
+| `test/selftest.mjs` | `apply()` 的注册调用、adapter 方法形状、HTTP API 增删改查、baseURL 规范化 |
+| `test/sse.mjs` | 假 OpenAI 上游发 SSE，断言完整 chunk 序列：reasoning/text 聚合、两个并行工具调用的 id/name/参数拼接、usage 扣缓存、`finish.kind = tool-calls`、DSH 消息 → OpenAI 消息的角色投影 |
+| `test/detect.mjs` | 10 种粘贴格式 + 假中转站分享链接 + 垃圾文本拒绝 |
+| `test/alias.mjs` | `id => 名字`、`id \| 名字`、对象形式、方括号自动清理、listModels/resolveModel 的名称与 id 分离 |
 
 ## 已知限制
 
