@@ -109,6 +109,23 @@ window.__ModuleLoader__.load({
 			},
 			ok: { fontSize: 12, color: "#3fbf7f" },
 			err: { fontSize: 12, color: "#e5716a" },
+			hintLine: { fontSize: 11.5, opacity: .72, lineHeight: 1.6, margin: "3px 0 0" },
+			details: { marginTop: 6 },
+			summary: { fontSize: 11.5, opacity: .6, cursor: "pointer", userSelect: "none" },
+			detailBox: {
+				margin: "5px 0 0",
+				padding: "7px 9px",
+				borderRadius: 7,
+				border: "1px solid rgba(127,127,127,.22)",
+				background: "rgba(127,127,127,.08)",
+				fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+				fontSize: 11,
+				opacity: .8,
+				whiteSpace: "pre-wrap",
+				wordBreak: "break-all",
+				maxHeight: 180,
+				overflow: "auto",
+			},
 			overlay: {
 				position: "fixed",
 				inset: 0,
@@ -200,6 +217,30 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		/**
+		 * 统一的上游失败展示：一句人话 + 该改哪儿 +（折叠的）原始报文。
+		 * 原始报文永远保留，只是默认收起，不糊用户一脸。
+		 */
+		function Failure(props) {
+			const result = props.result ?? {};
+			const head = props.prefix ?? "失败";
+			const message = String(result.error ?? "").trim() || "未知错误";
+			const hint = String(result.hint ?? "").trim();
+			const detail = String(result.detail ?? "").trim();
+			return h("div", null,
+				h("p", { style: { ...S.err, margin: 0, lineHeight: 1.6 } },
+					`${head} · ${message}` + (Number(result.status) > 0 ? `（HTTP ${result.status}）` : ""),
+				),
+				hint !== "" ? h("p", { style: S.hintLine }, "→ " + hint) : null,
+				detail !== ""
+					? h("details", { style: S.details },
+						h("summary", { style: S.summary }, "详情"),
+						h("pre", { style: S.detailBox }, detail),
+					)
+					: null,
+			);
+		}
+
 		function Editor(props) {
 			const { initial, onClose, onSaved } = props;
 			const [form, setForm] = useState(() => ({
@@ -214,6 +255,7 @@ window.__ModuleLoader__.load({
 			const [busy, setBusy] = useState("");
 			const [msg, setMsg] = useState(null);
 			const [tested, setTested] = useState(null);
+			const [pullError, setPullError] = useState(null);
 
 			const set = (key) => (value) => setForm((prev) => ({ ...prev, [key]: value }));
 
@@ -283,13 +325,14 @@ window.__ModuleLoader__.load({
 			const pullModels = async () => {
 				setBusy("pull");
 				setMsg(null);
+				setPullError(null);
 				const result = await api("/models", {
 					method: "POST",
 					body: JSON.stringify({ baseURL: form.baseURL.trim(), apiKey: form.apiKey.trim() }),
 				});
 				setBusy("");
 				if (result.ok !== true) {
-					setMsg({ kind: "err", text: `拉取失败：${result.error || "未知错误"}` });
+					setPullError(result);
 					return;
 				}
 				if (!Array.isArray(result.models) || result.models.length === 0) {
@@ -369,11 +412,14 @@ window.__ModuleLoader__.load({
 					msg !== null
 						? h("p", { style: msg.kind === "ok" ? S.ok : S.err }, msg.text)
 						: null,
+					pullError !== null
+						? h("div", { style: { marginBottom: 10 } }, h(Failure, { result: pullError, prefix: "拉取失败" }))
+						: null,
 					tested !== null
-						? h("div", { style: { marginBottom: 10, fontSize: 12, lineHeight: 1.6 } },
+						? h("div", { style: { marginBottom: 10 } },
 							tested.ok
-								? h("span", { style: S.ok }, `连通正常 · HTTP ${tested.status} · ${tested.ms}ms` + (tested.preview ? ` · 回复：${tested.preview}` : ""))
-								: h("span", { style: S.err }, `失败 · ${tested.error}`),
+								? h("p", { style: { ...S.ok, margin: 0 } }, `连通正常 · HTTP ${tested.status} · ${tested.ms}ms` + (tested.preview ? ` · 回复：${tested.preview}` : ""))
+								: h(Failure, { result: tested }),
 						)
 						: null,
 					h("div", { style: { ...S.row, marginTop: 6 } },
@@ -430,10 +476,9 @@ window.__ModuleLoader__.load({
 					}, "删除"),
 				),
 				result !== null
-					? h("p", { style: result.ok ? S.ok : S.err, marginTop: 0 },
-						result.ok
-							? `连通正常 · ${result.ms}ms` + (result.preview ? ` · ${result.preview}` : "")
-							: `失败 · ${result.error}`)
+					? result.ok
+						? h("p", { style: { ...S.ok, margin: 0 } }, `连通正常 · ${result.ms}ms` + (result.preview ? ` · ${result.preview}` : ""))
+						: h(Failure, { result })
 					: null,
 			);
 		}
@@ -607,7 +652,7 @@ window.__ModuleLoader__.load({
 		exports.name = name;
 		exports.inject = inject;
 		exports.apply = apply;
-		exports.__test = { SettingsPage, Editor, ChannelCard };
+		exports.__test = { SettingsPage, Editor, ChannelCard, Failure };
 		return module.exports;
 	},
 });

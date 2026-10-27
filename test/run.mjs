@@ -16,6 +16,8 @@ const CASES = [
   ['sse.mjs', 'SSE → StreamChunk 协议'],
   ['detect.mjs', '粘贴识别'],
   ['alias.mjs', '模型别名'],
+  ['errors.mjs', '上游报错翻译'],
+  ['client-error.mjs', '设置页失败展示'],
 ];
 
 let failed = 0;

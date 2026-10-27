@@ -73,7 +73,25 @@ gpt-4o-mini
 - The DSH-side model id keeps the real id, so renaming never breaks a selected model.
 - Get exact ids via the "pull model list from upstream" button, or `curl {baseURL}/models`.
 
-If you ever see `403 This token has no access to model X`, the key is fine — the model
+### Reading an error
+
+Raw upstream bodies (relay sites love dumping JSON blobs) no longer hit the UI. You get
+what went wrong plus what to change, and the upstream's own wording and the full body sit
+in a collapsed **details** section:
+
+| You see | HTTP | What it means / what to fix |
+|---|---|---|
+| API key was not accepted | 401 | key truncated, expired or revoked; some relays want it without the `sk-` prefix |
+| Key rejected: no permission or disabled | 403 | group/permission, IP allow-list, region lock, or the key was disabled |
+| Not enough balance | 402 | top up upstream, or use a key with quota |
+| No endpoint at this address | 404 | base URL must end at `/v1`; the model name must exist upstream |
+| Address points at a web page | 405 | base URL is the site root, not the API |
+| Rate limited, or quota used up | 429 | wait a bit; check plan quota and concurrency |
+| Upstream is failing | 5xx | retried once automatically; if it persists the provider is down |
+| Cannot reach this address | 0 | check base URL spelling, network, proxy |
+| Probe/test timed out | 0 | 12s / 20s without a response; try another route or fill model names by hand |
+
+`403 This token has no access to model X` lands in the 403 row: the key is fine, the model
 name is not exact. new-api style relays answer 403 (not 401) for an unknown model.
 
 ## How it works

@@ -126,6 +126,107 @@ function writeConfig(config) {
   fs.renameSync(tmp, CONFIG_FILE)
 }
 
+// ── 上游报错翻译 ────────────────────────────────────────────────────────────
+//
+// 上游（尤其是中转站）出错时爱把原始 HTTP 报错体整段吐出来，用户看到的是
+// `HTTP 403：{"error":{"message":"...","type":"...","code":"..."}}` 这种东西，
+// 既看不懂也不知道下一步该改哪儿。这里统一翻成三件事：
+//   message —— 一句话人话，说清是什么问题（可以带上上游自己的短说明）
+//   hint    —— 该动哪儿（设置页 / 对话里都会显示）
+//   detail  —— 原始报错体，只在「详情」里展开，永远不丢，方便排查
+// code 用 DSH 自己那套失败码，重试策略按它判断能不能重试。
+
+/** 从上游报错体里抠出它自己的错误码和错误消息；不是 JSON 就退化成纯文本。 */
+function readUpstreamError(rawText) {
+  const text = String(rawText ?? '').trim();
+  if (text === '') return { code: '', message: '' };
+  try {
+    const json = JSON.parse(text);
+    const error = json?.error ?? json;
+    const code = String(error?.code ?? error?.type ?? json?.code ?? json?.type ?? '').trim();
+    const message = String(error?.message ?? error?.msg ?? json?.message ?? json?.detail ?? '').trim();
+    return { code: code.slice(0, 80), message: message.replace(/\s+/g, ' ').slice(0, 400) };
+  } catch {
+    // 网关错误页（Cloudflare 502 之类）是 HTML，去掉标签留文字
+    const plain = text
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return { code: '', message: plain.slice(0, 400) };
+  }
+}
+
+/** HTTP 状态码 → 人话 + 该改什么 + DSH 失败码。 */
+function describeHttpStatus(status) {
+  switch (status) {
+    case 400:
+      return { message: '请求被上游判为不合法', hint: '先确认模型名是上游的真实 id（不是显示名），再看参数是否超出该模型支持范围', code: 'INVALID_REQUEST' };
+    case 401:
+      return { message: 'API Key 没被接受', hint: '检查 Key 有没有复制完整、是否已过期或被吊销；有的中转站要求 Key 不带 sk- 前缀', code: 'AUTH' };
+    case 402:
+      return { message: '账户余额不足', hint: '去上游控制台充值，或换一个有额度的 Key', code: 'QUOTA' };
+    case 403:
+      return { message: 'Key 被拒绝：没权限或被禁用', hint: '检查这个 Key 的分组/权限、IP 白名单、所在地区是否受限，或它已被上游停用', code: 'AUTH' };
+    case 404:
+      return { message: '这个地址下没有接口', hint: 'Base URL 要填到 /v1 这一层（插件自己拼 /chat/completions）；模型名也要在上游真实存在', code: 'INVALID_REQUEST' };
+    case 405:
+      return { message: '地址指到了网页，不是 API', hint: 'Base URL 大概填成了网站首页，改成 .../v1 这一层', code: 'INVALID_REQUEST' };
+    case 408:
+      return { message: '上游等太久，先超时了', hint: '稍后重试；长期这样换延迟更低的线路', code: 'TIMEOUT' };
+    case 413:
+      return { message: '这次请求太大（上下文或图片超限）', hint: '清一清会话历史，或换上下文窗口更大的模型', code: 'INVALID_REQUEST' };
+    case 422:
+      return { message: '参数不被接受', hint: '多半是模型名不对，或 temperature / max_tokens 超出该模型范围', code: 'INVALID_REQUEST' };
+    case 429:
+      return { message: '被限流，或额度已经用完', hint: '等几十秒再试；反复出现就去上游看套餐余量和并发限制', code: 'RATE_LIMIT' };
+    case 451:
+      return { message: '按地区被拒绝', hint: '这条线路对当前 IP 所在地区不开放，换线路或走代理', code: 'AUTH' };
+    default:
+      break;
+  }
+  if (status >= 500) {
+    return { message: '上游服务自己出错了', hint: '重试一次；一直不好就是上游故障，换渠道或换个时间段', code: 'SERVER' };
+  }
+  return { message: `上游返回 HTTP ${status}`, hint: '看下面「详情」里上游自己的说法再改配置', code: 'HTTP_' + status };
+}
+
+/**
+ * 一次上游失败 → 可直接展示的说明。
+ * @param {number} status HTTP 状态码；0 表示请求没能发出去
+ * @param {string} rawText 上游原始报错体
+ * @param {string} statusText response.statusText
+ */
+function explainUpstreamFailure(status, rawText, statusText) {
+  const code = Number(status) > 0 ? Math.floor(Number(status)) : 0;
+  const base = code > 0
+    ? describeHttpStatus(code)
+    : {
+      message: '连不上这个地址',
+      hint: '检查 Base URL 拼写、网络和代理；必须是 https:// 开头的完整地址',
+      code: 'TRANSPORT',
+    };
+  const upstream = readUpstreamError(rawText);
+  // 上游自己说的话通常最准（哪个模型没权限、缺哪个参数），短的话就并进结论里
+  let message = base.message;
+  if (upstream.message !== '' && upstream.message.length <= 140) message += '（上游：' + upstream.message + '）';
+  const detail = String(rawText ?? '').trim();
+  return {
+    message,
+    hint: base.hint,
+    code: base.code,
+    providerCode: upstream.code,
+    detail: detail !== '' ? detail.slice(0, 1200) : String(statusText ?? '').trim(),
+  };
+}
+
+/** 对话里那一条失败信息：结论 + 该改什么，原始报文只进日志。 */
+function failureTextOf(label, explained) {
+  const head = label !== '' ? label + '：' : '';
+  return explained.hint !== '' ? `${head}${explained.message}｜${explained.hint}` : head + explained.message;
+}
+
 // ── 消息投影：DSH 词汇 → OpenAI Chat Completions ──────────────────────────────
 
 function blocksOf(content) {
@@ -471,12 +572,16 @@ class UseModelAdapter {
       })
     } catch (error) {
       const aborted = options.signal?.aborted === true
+      const raw = error instanceof Error ? error.message : String(error)
+      if (!aborted) this.logger?.warn?.(`usemodel: ${channel.name} 请求发不出去：${raw}`)
       yield {
         type: 'finish',
         reason: {
           kind: aborted ? 'aborted' : 'error',
           failure: {
-            message: `${channel.name}：${error instanceof Error ? error.message : String(error)}`,
+            message: aborted
+              ? '已取消'
+              : failureTextOf(channel.name, explainUpstreamFailure(0, raw, '')),
             code: aborted ? 'ABORTED' : 'TRANSPORT',
           },
         },
@@ -486,13 +591,16 @@ class UseModelAdapter {
 
     if (!response.ok) {
       const text = await response.text().catch(() => '')
+      const explained = explainUpstreamFailure(response.status, text, response.statusText)
+      // 原始报文只进日志：对话里那句必须是能直接看懂的话
+      this.logger?.warn?.(`usemodel: ${channel.name} HTTP ${response.status} ${explained.providerCode || ''} ${explained.detail}`)
       yield {
         type: 'finish',
         reason: {
           kind: 'error',
           failure: {
-            message: `${channel.name} HTTP ${response.status}：${text.slice(0, 600) || response.statusText}`,
-            code: response.status === 401 || response.status === 403 ? 'AUTH' : 'SERVER',
+            message: failureTextOf(channel.name, explained),
+            code: explained.code,
           },
         },
       }
@@ -837,11 +945,28 @@ async function probeModels(baseURL, apiKey, timeoutMs = 12000) {
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      return { ok: false, status: response.status, error: text.slice(0, 300) || response.statusText }
+      const explained = explainUpstreamFailure(response.status, text, response.statusText)
+      return {
+        ok: false,
+        status: response.status,
+        error: explained.message,
+        hint: explained.hint,
+        detail: explained.detail,
+        code: explained.code,
+      }
     }
     const text = await response.text()
     let json
-    try { json = JSON.parse(text) } catch { return { ok: false, status: response.status, error: '返回的不是 JSON' } }
+    try { json = JSON.parse(text) } catch {
+      return {
+        ok: false,
+        status: response.status,
+        error: '上游返回的不是 JSON（这个地址多半不是 API）',
+        hint: 'Base URL 要填到 /v1 这一层；网页地址拿不到模型列表，模型名可以手填',
+        detail: text.slice(0, 1200),
+        code: 'INVALID_REQUEST',
+      }
+    }
     const list = Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : Array.isArray(json?.models) ? json.models : []
     const ids = list
       .map(item => typeof item === 'string' ? item : (item?.id ?? item?.model ?? item?.name))
@@ -849,7 +974,25 @@ async function probeModels(baseURL, apiKey, timeoutMs = 12000) {
     const chat = ids.filter(id => !NON_CHAT.test(id))
     return { ok: true, status: response.status, models: chat.length > 0 ? chat : ids, total: ids.length }
   } catch (error) {
-    return { ok: false, status: 0, error: controller.signal.aborted ? '超时 12s' : (error instanceof Error ? error.message : String(error)) }
+    const raw = error instanceof Error ? error.message : String(error)
+    if (controller.signal.aborted) {
+      return {
+        ok: false,
+        status: 0,
+        error: '探测超时（12 秒没响应）',
+        hint: '检查网络或代理；也可以跳过探测，模型名手填',
+        detail: 'probe timeout 12000ms',
+        code: 'TIMEOUT',
+      }
+    }
+    return {
+      ok: false,
+      status: 0,
+      error: '连不上这个地址（上游：' + raw.slice(0, 140) + '）',
+      hint: '检查 Base URL 拼写、网络和代理；必须是 https:// 开头的完整地址',
+      detail: raw,
+      code: 'TRANSPORT',
+    }
   } finally {
     clearTimeout(timer)
   }
@@ -1095,6 +1238,9 @@ export function apply(ctx) {
           total: probe.total ?? 0,
           status: probe.status ?? 0,
           error: probe.error ?? '',
+          hint: probe.hint ?? '',
+          detail: probe.detail ?? '',
+          code: probe.code ?? '',
         })
         return
       }
@@ -1129,7 +1275,17 @@ export function apply(ctx) {
           const text = await response.text().catch(() => '')
           const ms = Date.now() - started
           if (!response.ok) {
-            sendJson(res, 200, { ok: false, status: response.status, ms, error: text.slice(0, 800) || response.statusText })
+            const explained = explainUpstreamFailure(response.status, text, response.statusText)
+            logger.warn?.(`usemodel: 测连通 ${channel.name} HTTP ${response.status} ${explained.providerCode || ''} ${explained.detail}`)
+            sendJson(res, 200, {
+              ok: false,
+              status: response.status,
+              ms,
+              error: explained.message,
+              hint: explained.hint,
+              detail: explained.detail,
+              code: explained.code,
+            })
             return
           }
           let preview = ''
@@ -1139,11 +1295,18 @@ export function apply(ctx) {
           } catch { preview = text.slice(0, 200) }
           sendJson(res, 200, { ok: true, status: response.status, ms, preview })
         } catch (error) {
+          const raw = error instanceof Error ? error.message : String(error)
+          const aborted = controller.signal.aborted
           sendJson(res, 200, {
             ok: false,
             status: 0,
             ms: Date.now() - started,
-            error: controller.signal.aborted ? '超时 20s' : (error instanceof Error ? error.message : String(error)),
+            error: aborted ? '测试超时（20 秒没响应）' : '连不上这个地址（上游：' + raw.slice(0, 140) + '）',
+            hint: aborted
+              ? '上游太慢或连不通；检查地址、网络和代理后再试'
+              : '检查 Base URL 拼写、网络和代理；必须是 https:// 开头的完整地址',
+            detail: aborted ? 'test timeout 20000ms' : raw,
+            code: aborted ? 'TIMEOUT' : 'TRANSPORT',
           })
         } finally {
           clearTimeout(timer)

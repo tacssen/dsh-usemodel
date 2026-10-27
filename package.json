@@ -1,6 +1,6 @@
 {
   "name": "dsh-usemodel",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Use your own OpenAI-compatible API keys in DeepSeek Harness: paste a URL or a share link, the plugin detects it, pulls the model list, and the models show up in the model picker.",
   "main": "index.js",
