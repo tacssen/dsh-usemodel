@@ -1,0 +1,7 @@
+# dsh-usemodel bundle patch.
+#
+# 只插入插件本体这一行；provider 与设置页都在插件内部完成。
+# 数据落在 $DSH_HOME/usemodel/config.json，删除插件不会动它。
+- insert:
+    - id: usemodel
+      name: 'dsh-usemodel'

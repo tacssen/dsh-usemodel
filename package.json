@@ -1,0 +1,56 @@
+{
+  "name": "dsh-usemodel",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Use your own OpenAI-compatible API keys in DeepSeek Harness: paste a URL or a share link, the plugin detects it, pulls the model list, and the models show up in the model picker.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "custom-provider",
+    "openai-compatible",
+    "llm",
+    "api-key"
+  ],
+  "author": "tacssen",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tacssen/dsh-usemodel.git"
+  },
+  "homepage": "https://github.com/tacssen/dsh-usemodel#readme",
+  "bugs": {
+    "url": "https://github.com/tacssen/dsh-usemodel/issues"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dshTarget": "0.2.1-rc.2"
+}

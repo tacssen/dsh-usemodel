@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# 本地调试产物：真实 Key 绝不入库
+config.json
+*.local.json
+.env
+.env.*
+
+# 编辑器
+.vscode/
+.idea/
