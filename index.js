@@ -99,7 +99,25 @@ function normalizeChannel(raw) {
     models: models.slice(0, 200),
     maxTokens: Number(raw.maxTokens) > 0 ? Math.floor(Number(raw.maxTokens)) : 0,
     contextWindow: Number(raw.contextWindow) > 0 ? Math.floor(Number(raw.contextWindow)) : 0,
+    retry: normalizeRetry(raw.retry),
     updatedAt: Number(raw.updatedAt) > 0 ? Number(raw.updatedAt) : Date.now(),
+  }
+}
+
+/**
+ * 自动重连参数：0 / 空 = 跟全局（或内置默认）走。
+ * attempts 是总尝试次数，含第一次；1 表示不重连。
+ */
+function normalizeRetry(raw) {
+  if (raw === null || typeof raw !== 'object') return { attempts: 0, initialDelayMs: 0, maxDelayMs: 0 }
+  const pick = value => {
+    const n = Number(value)
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0
+  }
+  return {
+    attempts: Math.min(pick(raw.attempts ?? raw.maxAttempts), 12),
+    initialDelayMs: Math.min(pick(raw.initialDelayMs), 60000),
+    maxDelayMs: Math.min(pick(raw.maxDelayMs), 120000),
   }
 }
 
@@ -107,7 +125,8 @@ function normalizeConfig(raw) {
   const channels = Array.isArray(raw?.channels) ? raw.channels : []
   return {
     channels: channels.map(normalizeChannel).filter(c => c !== null),
-    defaultMaxTokens: Number(raw?.defaultMaxTokens) > 0 ? Math.floor(Number(raw.defaultMaxTokens)) : 8192,
+    defaultMaxTokens: Number(raw?.defaultMaxTokens) > 0 ? Math.floor(Number(raw.defaultMaxTokens)) : 65536,
+    retry: normalizeRetry(raw?.retry),
   }
 }
 
@@ -244,9 +263,57 @@ function textOf(blocks) {
   return out.join('\n')
 }
 
+// ── 图片附件 → data URL ─────────────────────────────────────────────────────
+//
+// 内核的 ImageBlock 只带 { attachmentId, mediaType, bytes, width, height, name }，
+// **没有 url 字段**：attachmentId 形如 `sha256:<hex>`，字节落在
+// $DSH_HOME/attachments/v1/objects/<hex 前两位>/<hex>。所以必须自己读盘，
+// 读到的 data URL 按 attachmentId + mediaType 缓存在进程内。
+
+const IMAGE_CACHE = new Map()
+
+/** 附件对象在宿主文件系统上的路径；id 不合格时返回 undefined。 */
+function attachmentObjectPath(attachmentId) {
+  const raw = String(attachmentId ?? '')
+  const hex = raw.startsWith('sha256:') ? raw.slice('sha256:'.length) : raw
+  if (!/^[0-9a-f]{64}$/.test(hex)) return undefined
+  return path.join(dshHome(), 'attachments', 'v1', 'objects', hex.slice(0, 2), hex)
+}
+
+function imageCacheKey(block) {
+  return String(block?.attachment?.attachmentId ?? '') + '|' + String(block?.attachment?.mediaType ?? '')
+}
+
+/** 已解析的 data URL；未解析返回 undefined。 */
 function imageUrlOf(block) {
-  const url = block?.attachment?.url
-  return typeof url === 'string' && url !== '' ? url : undefined
+  const direct = block?.attachment?.url
+  if (typeof direct === 'string' && direct !== '') return direct
+  return IMAGE_CACHE.get(imageCacheKey(block))
+}
+
+/** 把历史里所有图片附件读成 data URL 塞进缓存。 */
+async function primeImageCache(messages) {
+  const pending = new Map()
+  const collect = blocks => {
+    for (const block of blocks) {
+      if (block?.type !== 'image') continue
+      const key = imageCacheKey(block)
+      if (key === '|' || IMAGE_CACHE.has(key) || pending.has(key)) continue
+      pending.set(key, block)
+    }
+  }
+  for (const message of messages ?? []) {
+    collect(blocksOf(message.content))
+    for (const result of toolResultsOf(message)) collect(result.content)
+  }
+  for (const [key, block] of pending) {
+    const file = attachmentObjectPath(block.attachment?.attachmentId)
+    if (file === undefined) continue
+    const data = await fs.promises.readFile(file).catch(() => undefined)
+    if (data === undefined) continue
+    const mediaType = String(block.attachment?.mediaType ?? 'image/png')
+    IMAGE_CACHE.set(key, 'data:' + mediaType + ';base64,' + data.toString('base64'))
+  }
 }
 
 /** 一条消息携带的工具结果（V4 的 role:'tool' 与 V3 的 tool-result 包装块）。 */
@@ -350,6 +417,7 @@ function toChatMessages(messages) {
           } else if (block?.type === 'image') {
             const url = imageUrlOf(block)
             if (url !== undefined) parts.push({ type: 'image_url', image_url: { url } })
+            else parts.push({ type: 'text', text: '[有一张图片附件没能读取，仅按文字处理]' })
           }
         }
         if (parts.length === 0) {
@@ -440,6 +508,111 @@ function finishOf(token) {
   return { kind: 'stop' }
 }
 
+// ── 自动重连 ────────────────────────────────────────────────────────────────
+//
+// 中转站抖一下、网关 502、连接被掐、上游吐个空流，都很常见。Codex 的做法是
+// 「这一轮还没产出内容就安静重发」，用户看到的只是卡顿一下然后继续。这里同样：
+//   · 只重连「还没有任何 chunk 交出去」的失败 —— 有内容再重发会出重复块
+//   · 指数退避 + 抖动，别把抖动中的上游锤死
+//   · 上游给了 Retry-After 就听它的，但不超过 maxDelayMs
+//   · 默认总尝试 6 次（≈ Codex 的耐心程度），可在设置页/JSON 里改
+
+/**
+ * 这些失败码可以重发：上游 5xx、超时、连不上、空流、以及 429 限流
+ * （429 优先按上游的 Retry-After 等）。鉴权、额度、参数错误重发也没用。
+ */
+const RETRYABLE_CODES = new Set(['SERVER', 'TIMEOUT', 'TRANSPORT', 'EMPTY_RESPONSE', 'RATE_LIMIT'])
+
+const RETRY_DEFAULTS = Object.freeze({
+  attempts: 6,          // 总尝试次数（含第一次）
+  initialDelayMs: 800,
+  maxDelayMs: 20000,
+  jitterRatio: 0.25,
+})
+
+/**
+ * 重连参数：渠道自己填了就用渠道的，没填（0/缺失）退到全局，全局也没有就用内置默认。
+ * 三个字段各自兜底，所以只改其中一个不会把另外两个清零。
+ */
+function resolveStreamRetry(config, channel) {
+  const pick = (field, fallback, min, max) => {
+    for (const source of [channel?.retry, config?.retry]) {
+      const value = Math.floor(Number(source?.[field]))
+      if (Number.isFinite(value) && value >= min) return Math.min(value, max)
+    }
+    return fallback
+  }
+  const resolved = {
+    attempts: pick('attempts', RETRY_DEFAULTS.attempts, 1, 12),
+    initialDelayMs: pick('initialDelayMs', RETRY_DEFAULTS.initialDelayMs, 1, 60000),
+    maxDelayMs: pick('maxDelayMs', RETRY_DEFAULTS.maxDelayMs, 100, 120000),
+  }
+  if (resolved.initialDelayMs > resolved.maxDelayMs) resolved.initialDelayMs = resolved.maxDelayMs
+  return resolved
+}
+
+/** 第 n 次失败后的等待时间：指数增长、封顶、带抖动；上游 Retry-After 优先。 */
+function backoffDelay(retry, attempt, retryAfterMs) {
+  const hinted = Number(retryAfterMs)
+  const jitter = 1 - RETRY_DEFAULTS.jitterRatio + 2 * RETRY_DEFAULTS.jitterRatio * Math.random()
+  if (Number.isFinite(hinted) && hinted > 0) return Math.min(Math.round(hinted), retry.maxDelayMs)
+  const exponent = Math.min(attempt - 1, 10)
+  const exponential = Math.min(retry.initialDelayMs * 2 ** exponent, retry.maxDelayMs)
+  return Math.min(Math.round(exponential * jitter), retry.maxDelayMs)
+}
+
+/** 上游的 Retry-After 可能是秒数也可能是 HTTP 日期。 */
+function readRetryAfterMs(response) {
+  let header
+  try { header = response?.headers?.get?.('retry-after') } catch { return 0 }
+  const raw = String(header ?? '').trim()
+  if (raw === '') return 0
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    const seconds = Number(raw)
+    return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1000) : 0
+  }
+  const at = Date.parse(raw)
+  if (!Number.isFinite(at)) return 0
+  const delta = at - Date.now()
+  return delta > 0 ? delta : 0
+}
+
+/** 失败信息带上 providerRetryAfterMs，内核那条重试链也能照着等。 */
+function withRetryAfter(failure, retryAfterMs) {
+  const value = Number(retryAfterMs)
+  if (!Number.isFinite(value) || value <= 0) return failure
+  return { ...failure, providerRetryAfterMs: Math.round(value) }
+}
+
+/** 可取消的等待；signal 中止就立刻返回 false，别把重连拖到用户点了停止之后。 */
+function sleepUnlessAborted(delayMs, signal) {
+  if (delayMs <= 0) return Promise.resolve(signal?.aborted !== true)
+  if (signal?.aborted === true) return Promise.resolve(false)
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { signal?.removeEventListener?.('abort', onAbort); resolve(true) }, delayMs)
+    function onAbort() { clearTimeout(timer); resolve(false) }
+    signal?.addEventListener?.('abort', onAbort, { once: true })
+  })
+}
+
+/** 一次请求的 body；重连时要原样重发，所以单独抽出来只算一次。 */
+function buildChatBody(options, channel, config, upstreamModel) {
+  const body = {
+    model: upstreamModel,
+    stream: true,
+    stream_options: { include_usage: true },
+    messages: toChatMessages(options.messages),
+  }
+  const tools = toToolDefs(options.tools)
+  if (tools.length > 0) body.tools = tools
+  if (typeof options.temperature === 'number' && Number.isFinite(options.temperature)) body.temperature = options.temperature
+  const maxTokens = Number(options.maxTokens) > 0
+    ? Math.floor(options.maxTokens)
+    : channel.maxTokens > 0 ? channel.maxTokens : config.defaultMaxTokens
+  if (maxTokens > 0) body.max_tokens = maxTokens
+  return body
+}
+
 // ── adapter ─────────────────────────────────────────────────────────────────
 
 const FALLBACK_IMAGE_PRICING = Object.freeze({
@@ -514,7 +687,7 @@ class UseModelAdapter {
         ? (channel.name + ' · ' + entry.name)
         : (channel !== undefined ? channel.name + ' · ' + upstreamModel : upstreamModel),
       inputModalities: ['text', 'image'],
-      context: { contextWindow: channel?.contextWindow > 0 ? channel.contextWindow : 128000 },
+      context: { contextWindow: channel?.contextWindow > 0 ? channel.contextWindow : 512000 },
       defaultMaxTokens: channel?.maxTokens > 0 ? channel.maxTokens : config.defaultMaxTokens,
     }
   }
@@ -528,6 +701,10 @@ class UseModelAdapter {
 
   /**
    * 一轮生成。上游只讲 OpenAI Chat Completions（/chat/completions, stream:true）。
+   *
+   * 失败自动重连：只要这一轮还没有任何 chunk 交给客户端，就退避重发同一个请求
+   * （Codex 式，静默进行，用户看到的是「卡一下然后继续」）；一旦已经有内容出去
+   * 就绝不重连 —— 重发只会让会话里出现两份重复的块。
    * @param {object} options GenerateOptions
    */
   async * stream(options) {
@@ -544,20 +721,49 @@ class UseModelAdapter {
       return
     }
 
-    const body = {
-      model: upstreamModel,
-      stream: true,
-      stream_options: { include_usage: true },
-      messages: toChatMessages(options.messages),
-    }
-    const tools = toToolDefs(options.tools)
-    if (tools.length > 0) body.tools = tools
-    if (typeof options.temperature === 'number' && Number.isFinite(options.temperature)) body.temperature = options.temperature
-    const maxTokens = Number(options.maxTokens) > 0
-      ? Math.floor(options.maxTokens)
-      : channel.maxTokens > 0 ? channel.maxTokens : config.defaultMaxTokens
-    if (maxTokens > 0) body.max_tokens = maxTokens
+    await primeImageCache(options.messages)
+    const body = buildChatBody(options, channel, config, upstreamModel)
+    const retry = resolveStreamRetry(config, channel)
 
+    let attempt = 0
+    while (true) {
+      attempt += 1
+      const run = this.attemptStream(options, channel, body)
+      let delivered = false
+      let step = await run.next()
+      while (step.done !== true) {
+        delivered = true
+        yield step.value
+        step = await run.next()
+      }
+      const outcome = step.value
+      if (outcome === null) return
+
+      // 内容已经交出去了，或者这次失败不该重发，或者预算用完：如实收尾
+      if (delivered || outcome.retryable !== true || attempt >= retry.attempts) {
+        yield { type: 'finish', reason: { kind: 'error', failure: withRetryAfter(outcome.failure, outcome.retryAfterMs) } }
+        return
+      }
+
+      const delayMs = backoffDelay(retry, attempt, outcome.retryAfterMs)
+      this.logger?.warn?.(`usemodel: ${channel.name} 第 ${attempt} 次请求失败（${outcome.failure.code}），${delayMs}ms 后自动重连（第 ${attempt + 1}/${retry.attempts} 次尝试）`)
+      if (!await sleepUnlessAborted(delayMs, options.signal)) {
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { message: '已取消', code: 'ABORTED' } } }
+        return
+      }
+    }
+  }
+
+  /**
+   * 发一次请求，把 SSE 读成 StreamChunk。
+   *
+   * generator 的返回值说明这次尝试怎么结束：
+   *   null    —— 正常走完，finish 已经 yield 出去了
+   *   outcome —— 失败；retryable 表示这次失败能不能重发（最终要不要重连由外层按
+   *              「有没有内容出去」再判一次）
+   * @returns {AsyncGenerator<object, null | { failure: object, retryable: boolean, retryAfterMs: number }, void>}
+   */
+  async * attemptStream(options, channel, body) {
     let response
     try {
       response = await fetch(channel.baseURL + '/chat/completions', {
@@ -571,22 +777,18 @@ class UseModelAdapter {
         signal: options.signal,
       })
     } catch (error) {
-      const aborted = options.signal?.aborted === true
-      const raw = error instanceof Error ? error.message : String(error)
-      if (!aborted) this.logger?.warn?.(`usemodel: ${channel.name} 请求发不出去：${raw}`)
-      yield {
-        type: 'finish',
-        reason: {
-          kind: aborted ? 'aborted' : 'error',
-          failure: {
-            message: aborted
-              ? '已取消'
-              : failureTextOf(channel.name, explainUpstreamFailure(0, raw, '')),
-            code: aborted ? 'ABORTED' : 'TRANSPORT',
-          },
-        },
+      // 主动取消不算失败，重连也没有意义
+      if (options.signal?.aborted === true) {
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { message: '已取消', code: 'ABORTED' } } }
+        return null
       }
-      return
+      const raw = error instanceof Error ? error.message : String(error)
+      this.logger?.warn?.(`usemodel: ${channel.name} 请求发不出去：${raw}`)
+      return {
+        retryable: true,
+        retryAfterMs: 0,
+        failure: { message: failureTextOf(channel.name, explainUpstreamFailure(0, raw, '')), code: 'TRANSPORT' },
+      }
     }
 
     if (!response.ok) {
@@ -594,21 +796,15 @@ class UseModelAdapter {
       const explained = explainUpstreamFailure(response.status, text, response.statusText)
       // 原始报文只进日志：对话里那句必须是能直接看懂的话
       this.logger?.warn?.(`usemodel: ${channel.name} HTTP ${response.status} ${explained.providerCode || ''} ${explained.detail}`)
-      yield {
-        type: 'finish',
-        reason: {
-          kind: 'error',
-          failure: {
-            message: failureTextOf(channel.name, explained),
-            code: explained.code,
-          },
-        },
+      const failure = { message: failureTextOf(channel.name, explained), code: explained.code }
+      if (!RETRYABLE_CODES.has(explained.code)) {
+        yield { type: 'finish', reason: { kind: 'error', failure } }
+        return null
       }
-      return
+      return { retryable: true, retryAfterMs: readRetryAfterMs(response), failure }
     }
     if (response.body === null) {
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: `${channel.name}：上游没有返回流`, code: 'EMPTY_RESPONSE' } } }
-      return
+      return { retryable: true, retryAfterMs: 0, failure: { message: `${channel.name}：上游没有返回流`, code: 'EMPTY_RESPONSE' } }
     }
 
     // ── SSE → StreamChunk ──────────────────────────────────────────────────
@@ -722,23 +918,28 @@ class UseModelAdapter {
       }
     } catch (error) {
       while (pending.length > 0) yield pending.shift()
-      const aborted = options.signal?.aborted === true
-      yield {
-        type: 'finish',
-        reason: {
-          kind: aborted ? 'aborted' : 'error',
-          failure: {
-            message: `${channel.name}：流读取失败 ${error instanceof Error ? error.message : String(error)}`,
-            code: aborted ? 'ABORTED' : 'TRANSPORT',
-          },
+      if (options.signal?.aborted === true) {
+        yield { type: 'finish', reason: { kind: 'aborted', failure: { message: '已取消', code: 'ABORTED' } } }
+        return null
+      }
+      return {
+        retryable: true,
+        retryAfterMs: 0,
+        failure: {
+          message: `${channel.name}：流读取失败 ${error instanceof Error ? error.message : String(error)}`,
+          code: 'TRANSPORT',
         },
       }
-      return
     } finally {
       try { reader.releaseLock() } catch { /* 已释放 */ }
     }
 
     while (pending.length > 0) yield pending.shift()
+
+    // 上游什么都没给：按可重连处理，让外层再要一次
+    if (!sawAny) {
+      return { retryable: true, retryAfterMs: 0, failure: { message: `${channel.name}：上游返回了空响应`, code: 'EMPTY_RESPONSE' } }
+    }
 
     // 收尾：按开块顺序关闭
     if (reasoningBlock !== null && reasoningBlock.text !== '') {
@@ -765,11 +966,8 @@ class UseModelAdapter {
     const usage = mapUsage(usageRaw)
     if (usage !== undefined) yield { type: 'usage', usage }
 
-    if (!sawAny) {
-      yield { type: 'finish', reason: { kind: 'error', failure: { message: `${channel.name}：上游返回了空响应`, code: 'EMPTY_RESPONSE' } } }
-      return
-    }
     yield { type: 'finish', reason: finishOf(finishToken) }
+    return null
   }
 }
 

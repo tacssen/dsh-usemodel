@@ -87,12 +87,37 @@ in a collapsed **details** section:
 | No endpoint at this address | 404 | base URL must end at `/v1`; the model name must exist upstream |
 | Address points at a web page | 405 | base URL is the site root, not the API |
 | Rate limited, or quota used up | 429 | wait a bit; check plan quota and concurrency |
-| Upstream is failing | 5xx | retried once automatically; if it persists the provider is down |
+| Upstream is failing | 5xx | retried automatically with backoff (see below); if it persists the provider is down |
 | Cannot reach this address | 0 | check base URL spelling, network, proxy |
 | Probe/test timed out | 0 | 12s / 20s without a response; try another route or fill model names by hand |
 
 `403 This token has no access to model X` lands in the 403 row: the key is fine, the model
 name is not exact. new-api style relays answer 403 (not 401) for an unknown model.
+
+### Automatic retry
+
+Relay sites flap, gateways throw 502, sockets get cut, upstream returns an empty stream.
+The plugin re-sends quietly, Codex style: you just see a short pause and the answer
+continuing, instead of having to press continue.
+
+- It only retries while **nothing from this turn has reached the UI yet**. Content you
+  already saw is never re-sent, otherwise the transcript would carry duplicate blocks.
+- Exponential backoff with jitter: 800 ms first, capped at 20 s, 6 total attempts by default.
+- A provider `Retry-After` header wins (seconds or an HTTP date), bounded by the max delay.
+- Retried: 5xx, timeouts, unreachable, empty stream, 429 rate limits.
+  Not retried: 401/403/404/402, where re-sending cannot help.
+- Pressing stop during the wait aborts at once and sends no further request.
+
+Tune it per channel; empty means "use the global default":
+
+| Field | Default | Meaning |
+|---|---|---|
+| `retry.attempts` | 6 | total attempts including the first; 1 disables retry, max 12 |
+| `retry.initialDelayMs` | 800 | wait before the first retry |
+| `retry.maxDelayMs` | 20000 | per-wait cap, also the `Retry-After` cap |
+
+Editable in the settings dialog, or directly in `config.json`: per channel inside a
+`channels[]` entry, globally as a top-level `retry` object (channel wins).
 
 ## How it works
 
@@ -118,13 +143,31 @@ name is not exact. new-api style relays answer 403 (not 401) for an unknown mode
       "baseURL": "https://api.openai.com/v1",
       "apiKey": "sk-...",
       "models": ["gpt-4o-mini"],
-      "contextWindow": 128000,
-      "maxTokens": 8192
+      "contextWindow": 1000000,
+      "maxTokens": 65536,
+      "retry": { "attempts": 6, "initialDelayMs": 800, "maxDelayMs": 20000 }
     }
   ],
-  "defaultMaxTokens": 8192
+  "defaultMaxTokens": 65536,
+  "retry": { "attempts": 6, "initialDelayMs": 800, "maxDelayMs": 20000 }
 }
 ```
+
+Both token fields are optional; leave them 0 to use the plugin defaults:
+
+| Field | Default | Effect |
+|---|---|---|
+| `contextWindow` | `1000000` | Capacity reported to the kernel; drives the auto-compaction threshold (`floor(contextWindow × 0.8)`) and the usage bar |
+| `maxTokens` / `defaultMaxTokens` | `65536` | Per-response `max_tokens`, also the completion budget reserved during compaction |
+
+Constraint: keep `maxTokens` well below `contextWindow`, and
+`floor(contextWindow × 0.8) > maxTokens + headroomTokens(65536)`, otherwise the compactor refuses to
+start with `leaving no pressure budget`. The defaults `1000000 / 65536` satisfy it: threshold 800000,
+reserved 65536.
+
+`contextWindow` is a **local declaration**: it only paces DSH compaction and does not make the upstream
+accept more tokens. A value above the upstream real ceiling gets long requests rejected there.
+Same for `max_tokens`: raising it grants headroom, the model still stops when it is done.
 
 Plaintext key, local machine only. Removing the plugin leaves the file alone; hand edits are
 picked up on the next request.

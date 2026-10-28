@@ -14,3 +14,6 @@ config.json
 # 编辑器
 .vscode/
 .idea/
+
+# 本地备份（改代码前留的副本），不入库
+*.bak-*

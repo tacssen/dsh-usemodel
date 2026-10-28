@@ -168,7 +168,11 @@ window.__ModuleLoader__.load({
 			modelsText: "",
 			contextWindow: "",
 			maxTokens: "",
+			retryAttempts: "",
+			retryInitialDelayMs: "",
+			retryMaxDelayMs: "",
 		};
+
 
 		/** 常用端点，点一下就填上 Base URL。 */
 		const PRESETS = [
@@ -251,6 +255,9 @@ window.__ModuleLoader__.load({
 				modelsText: (initial?.models ?? []).map(modelToLine).filter((line) => line !== "").join("\n"),
 				contextWindow: initial?.contextWindow ? String(initial.contextWindow) : "",
 				maxTokens: initial?.maxTokens ? String(initial.maxTokens) : "",
+				retryAttempts: initial?.retry?.attempts ? String(initial.retry.attempts) : "",
+				retryInitialDelayMs: initial?.retry?.initialDelayMs ? String(initial.retry.initialDelayMs) : "",
+				retryMaxDelayMs: initial?.retry?.maxDelayMs ? String(initial.retry.maxDelayMs) : "",
 			}));
 			const [busy, setBusy] = useState("");
 			const [msg, setMsg] = useState(null);
@@ -273,6 +280,11 @@ window.__ModuleLoader__.load({
 						models,
 						contextWindow: Number(form.contextWindow) || 0,
 						maxTokens: Number(form.maxTokens) || 0,
+						retry: {
+							attempts: Number(form.retryAttempts) || 0,
+							initialDelayMs: Number(form.retryInitialDelayMs) || 0,
+							maxDelayMs: Number(form.retryMaxDelayMs) || 0,
+						},
 					},
 				};
 			}, [form]);
@@ -403,10 +415,27 @@ window.__ModuleLoader__.load({
 					),
 					h("div", { style: { display: "flex", gap: 10 } },
 						h("div", { style: { flex: 1 } },
-							h(Field, { label: "上下文窗口（可空，默认 128000）", value: form.contextWindow, onChange: set("contextWindow"), placeholder: "128000" }),
+							h(Field, { label: "上下文窗口（可空，默认 512000）", value: form.contextWindow, onChange: set("contextWindow"), placeholder: "512000" }),
 						),
 						h("div", { style: { flex: 1 } },
-							h(Field, { label: "单次最大输出（可空）", value: form.maxTokens, onChange: set("maxTokens"), placeholder: "8192" }),
+							h(Field, { label: "单次最大输出（可空）", value: form.maxTokens, onChange: set("maxTokens"), placeholder: "65536" }),
+						),
+					),
+					h("div", { style: { display: "flex", gap: 10 } },
+						h("div", { style: { flex: 1.2 } },
+							h(Field, {
+								label: "失败自动重连次数",
+								value: form.retryAttempts,
+								onChange: set("retryAttempts"),
+								placeholder: "6",
+								hint: "总尝试次数（含第一次）。1 = 不重连；留空用默认 6。只在没吐出内容时重发",
+							}),
+						),
+						h("div", { style: { flex: 1 } },
+							h(Field, { label: "首次等待（毫秒）", value: form.retryInitialDelayMs, onChange: set("retryInitialDelayMs"), placeholder: "800" }),
+						),
+						h("div", { style: { flex: 1 } },
+							h(Field, { label: "最长等待（毫秒）", value: form.retryMaxDelayMs, onChange: set("retryMaxDelayMs"), placeholder: "20000" }),
 						),
 					),
 					msg !== null
@@ -461,6 +490,10 @@ window.__ModuleLoader__.load({
 						h("div", { style: { ...S.row, gap: 8 } },
 							h("strong", { style: { fontSize: 13.5 } }, channel.name),
 							h("span", { style: S.tag }, `${channel.models.length} 个模型`),
+							h("span", { style: S.tag },
+								(channel.retry?.attempts ?? 0) > 0
+									? `失败重连 ${channel.retry.attempts} 次`
+									: "失败重连：默认"),
 						),
 						h("div", { style: { ...S.mono, marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
 							channel.baseURL + "  ·  " + maskKey(channel.apiKey)),
